@@ -1,0 +1,16 @@
+{
+  "name": "pi-session-review",
+  "version": "1.0.0",
+  "description": "Analyze pi sessions with configurable review presets",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "skills": [],
+    "prompts": [],
+    "themes": []
+  }
+}
