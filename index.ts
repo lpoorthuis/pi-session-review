@@ -26,7 +26,9 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { complete, type Message } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
@@ -240,6 +242,129 @@ async function showReport(
   });
 }
 
+// ── Share session via GitHub gist ──────────────────────────────────────
+
+type ExportSessionToHtml = (
+  sessionManager: any,
+  state?: {
+    systemPrompt?: string;
+    tools?: Array<{ name: string; description?: string; parameters?: unknown }>;
+  },
+  options?: string | { outputPath?: string },
+) => Promise<string>;
+
+let _exportSessionToHtml: ExportSessionToHtml | undefined;
+
+async function getExportFn(): Promise<ExportSessionToHtml> {
+  if (_exportSessionToHtml) return _exportSessionToHtml;
+
+  const piEntryUrl = import.meta.resolve("@mariozechner/pi-coding-agent");
+  const piEntry = new URL(piEntryUrl).pathname;
+  const exportModulePath = path.join(path.dirname(piEntry), "core", "export-html", "index.js");
+  const mod = (await import(pathToFileURL(exportModulePath).href)) as {
+    exportSessionToHtml: ExportSessionToHtml;
+  };
+  _exportSessionToHtml = mod.exportSessionToHtml;
+  return _exportSessionToHtml;
+}
+
+function getShareViewerUrl(gistId: string): string {
+  const base = process.env.PI_SHARE_VIEWER_URL || "https://pi.dev/session/";
+  const normalizedBase = base.includes("#") ? base.replace(/#.*$/, "#") : `${base}#`;
+  return `${normalizedBase}${gistId}`;
+}
+
+/**
+ * Exports the current session as HTML, uploads it as a secret GitHub gist,
+ * and returns the pi.dev/session viewer URL (or null on failure).
+ *
+ * Optimised: skips the separate `gh auth status` check (gist create will
+ * fail fast if unauthenticated) and fires the description-edit without
+ * waiting for it to finish.
+ */
+async function shareSessionAsGist(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  name: string,
+): Promise<string | null> {
+  const sessionFile = ctx.sessionManager.getSessionFile();
+  if (!sessionFile) return null;
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-session-review-"));
+  const tmpFile = path.join(tmpDir, "session.html");
+
+  try {
+    // Export current session to HTML
+    const allTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool] as const));
+    const activeTools = pi
+      .getActiveTools()
+      .map((name) => allTools.get(name))
+      .filter((tool): tool is NonNullable<typeof tool> => Boolean(tool))
+      .map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
+      }));
+
+    let systemPrompt: string | undefined;
+    try {
+      systemPrompt = ctx.getSystemPrompt();
+    } catch {
+      systemPrompt = undefined;
+    }
+
+    const exportSessionToHtml = await getExportFn();
+    await exportSessionToHtml(ctx.sessionManager, { systemPrompt, tools: activeTools }, tmpFile);
+
+    // Create secret gist — no prior auth check; gh will fail fast if not logged in
+    const result = await pi.exec(
+      "gh",
+      ["gist", "create", "--desc", `session-review: ${name}`, tmpFile],
+      { signal: ctx.signal },
+    );
+
+    if (result.code !== 0) return null;
+
+    const gistUrl = result.stdout
+      .trim()
+      .split(/\s+/)
+      .find((part) => part.startsWith("https://gist.github.com/"));
+    const gistId = gistUrl?.split("/").pop();
+    if (!gistId) return null;
+
+    const previewUrl = getShareViewerUrl(gistId);
+
+    // Fire-and-forget: update gist description with viewer URL
+    const fullDesc = `session-review: ${name} — ${previewUrl}`;
+    pi.exec("gh", ["gist", "edit", gistId, "--desc", fullDesc]).catch(() => {});
+
+    return previewUrl;
+  } catch {
+    return null;
+  } finally {
+    try {
+      fs.rmSync(tmpDir, { recursive: true });
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
+}
+
+/**
+ * Inject a share link into the HTML report right after the first <h1> tag.
+ * Falls back to prepending if no <h1> is found.
+ */
+function injectShareLink(html: string, shareUrl: string): string {
+  const linkHtml = `<p style="margin-top:4px"><a href="${shareUrl}" target="_blank" rel="noopener">View full session transcript ↗</a></p>`;
+  const h1Close = html.indexOf("</h1>");
+  if (h1Close !== -1) {
+    const insertAt = h1Close + "</h1>".length;
+    return html.slice(0, insertAt) + "\n" + linkHtml + html.slice(insertAt);
+  }
+  // No <h1> found — prepend
+  return linkHtml + "\n" + html;
+}
+
 // ── Extension ──────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
@@ -306,6 +431,13 @@ export default function (pi: ExtensionAPI) {
       const sessionContextText = serializeSessionContext(sessionContext);
       const analysisPrompt = buildAnalysisPrompt(selectedPreset, sessionContextText);
 
+      const safeName = selectedPreset.name.replace(/[^\w.-]+/g, "_").toLowerCase();
+
+      // Kick off gist creation and LLM analysis in parallel.
+      // The LLM call dominates wall-clock time so the gist is typically
+      // ready well before the report finishes.
+      const sharePromise = shareSessionAsGist(pi, ctx, safeName);
+
       // Run analysis with loading UI
       const report = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
         const loader = new BorderedLoader(
@@ -330,16 +462,14 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // Show in custom UI
-      // await showReport(report, selectedPreset.name, ctx);
+      // Await the share URL (likely already resolved) and inject into HTML
+      const shareUrl = await sharePromise;
+      const finalReport = shareUrl ? injectShareLink(report, shareUrl) : report;
 
-      // Also save to file
+      // Save report to the working directory (where the agent was started)
       const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-      const safeName = selectedPreset.name.replace(/[^\w.-]+/g, "_").toLowerCase();
-      const outputDir = path.join(extensionDir, "reports");
-      fs.mkdirSync(outputDir, { recursive: true });
-      const outputPath = path.join(outputDir, `${timestamp}_${safeName}.html`);
-      fs.writeFileSync(outputPath, report, "utf-8");
+      const outputPath = path.join(ctx.cwd, `${timestamp}_${safeName}.html`);
+      fs.writeFileSync(outputPath, finalReport, "utf-8");
 
       ctx.ui.notify(`Report saved to ${outputPath}`, "info");
     },
